@@ -1066,7 +1066,7 @@ def main() -> None:
 
     # EMA for smoother weights (better quantization)
     ema_decay = 0.999
-    ema_start_frac = 0.5  # start EMA at 50% of training
+    ema_start_frac = 2.0  # disabled (set <1.0 to enable)
     ema_state: dict[str, Tensor] | None = None
 
     # -----------------------------
