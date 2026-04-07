@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import glob
 import json
+import lzma
 import math
 import os
 import pickle
@@ -1128,7 +1129,7 @@ def main() -> None:
 
     quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = lzma.compress(quant_raw, preset=9 | lzma.PRESET_EXTREME)
     quant_serialized_bytes = len(quant_raw)
     quant_path = out_dir / f"{args.run_id}_mlx_model.int8.ptz"
     with quant_path.open("wb") as f:
@@ -1142,7 +1143,7 @@ def main() -> None:
 
     with quant_path.open("rb") as f:
         quant_blob_disk = f.read()
-    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+    quant_flat = dequantize_state_dict_int8(pickle.loads(lzma.decompress(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
