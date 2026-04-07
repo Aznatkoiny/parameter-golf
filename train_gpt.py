@@ -66,7 +66,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -694,6 +694,14 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        # XSA: subtract projection of output onto self-value direction to reduce redundancy
+        if self.num_kv_heads != self.num_heads:
+            v_self = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+        else:
+            v_self = v
+        dots = (y * v_self).sum(dim=-1, keepdim=True)
+        v_norm_sq = (v_self * v_self).sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        y = y - (dots / v_norm_sq) * v_self
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -1056,6 +1064,11 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
+    # EMA for smoother weights (better quantization)
+    ema_decay = 0.999
+    ema_start_frac = 0.5  # start EMA at 50% of training
+    ema_state: dict[str, Tensor] | None = None
+
     # -----------------------------
     # MAIN TRAINING LOOP
     # -----------------------------
@@ -1129,6 +1142,15 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # EMA update: track smoothed weights for better quantization
+        if stop_after_step is not None or (max_wallclock_ms and approx_training_time_ms >= max_wallclock_ms * ema_start_frac):
+            sd = base_model.state_dict()
+            if ema_state is None:
+                ema_state = {k: v.clone() for k, v in sd.items()}
+            else:
+                for k in ema_state:
+                    ema_state[k].mul_(ema_decay).add_(sd[k], alpha=1.0 - ema_decay)
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
@@ -1154,6 +1176,11 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    # Load EMA weights for serialization (smoother = better quantization)
+    if ema_state is not None:
+        log0(f"ema:loading smoothed weights (decay={ema_decay})")
+        base_model.load_state_dict(ema_state, strict=True)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
