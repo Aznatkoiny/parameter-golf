@@ -1143,7 +1143,7 @@ def main() -> None:
         zero_grad_all()
 
         # EMA update: track smoothed weights for better quantization
-        if stop_after_step is not None or (max_wallclock_ms and approx_training_time_ms >= max_wallclock_ms * ema_start_frac):
+        if stop_after_step is not None or (max_wallclock_ms and elapsed_ms >= max_wallclock_ms * ema_start_frac):
             sd = base_model.state_dict()
             if ema_state is None:
                 ema_state = {k: v.clone() for k, v in sd.items()}
