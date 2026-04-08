@@ -408,20 +408,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 # INT6 QUANTIZATION (added alongside int8)
 # -----------------------------
 
-def _hadamard_rotate_rows(t: Tensor) -> Tensor:
-    """Apply a fast Walsh-Hadamard-like random sign flip + permutation to spread outliers."""
-    # Simple but effective: multiply each column by a fixed random sign pattern
-    # This is a cheap approximation of the full Hadamard rotation from QuaRot/SpinQuant
-    gen = torch.Generator()
-    gen.manual_seed(42)
-    signs = (torch.randint(0, 2, (t.shape[1],), generator=gen).float() * 2 - 1)
-    return t * signs[None, :]
-
-
 def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        t32 = _hadamard_rotate_rows(t32)
         row_max = t32.abs().amax(dim=1)
         scale = (row_max / 31.0).clamp_min(1e-12).to(torch.float16)
         scale = scale.clamp_min(torch.finfo(torch.float16).tiny)
@@ -455,7 +444,7 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor]):
             passthrough[name] = t
             stats["int6_payload_bytes"] += tensor_nbytes(t)
             continue
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or "tok_emb" in name:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int6_payload_bytes"] += tensor_nbytes(kept)
@@ -492,9 +481,6 @@ def dequantize_state_dict_int6(obj: dict[str, object]) -> dict[str, Tensor]:
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
             deq = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1))))
-            # Undo Hadamard rotation applied during quantization
-            if deq.ndim == 2:
-                deq = _hadamard_rotate_rows(deq)  # sign flip is its own inverse
             out[name] = deq.to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
