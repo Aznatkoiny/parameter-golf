@@ -738,10 +738,16 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # SmearGate: learned gate for previous-token mixing (KV shifting)
+        self.smear_gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        # SmearGate: blend in previous token's representation
+        gate = torch.sigmoid(self.smear_gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([x[:, :1, :], x[:, :-1, :]], dim=1)
+        x = (1 - gate) * x + gate * x_prev
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
