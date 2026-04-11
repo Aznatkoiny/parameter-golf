@@ -67,6 +67,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
+    bigram_hash_buckets = int(os.environ.get("BIGRAM_HASH_BUCKETS", 4096))
+    bigram_hash_dim = int(os.environ.get("BIGRAM_HASH_DIM", 128))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -85,8 +87,10 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
+    swa_every = int(os.environ.get("SWA_EVERY", 50))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -609,6 +613,45 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class SmearGate(nn.Module):
+    """Blend each token's embedding with the previous token's embedding."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    """Hash consecutive token pairs into a learned embedding table."""
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -762,6 +805,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        bigram_hash_buckets: int = 0,
+        bigram_hash_dim: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -770,6 +815,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.smear_gate = SmearGate(model_dim)
+        self.bigram_emb = BigramHashEmbedding(bigram_hash_buckets, bigram_hash_dim, model_dim) if bigram_hash_buckets > 0 else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -799,9 +846,14 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+            elif isinstance(module, nn.Linear) and not getattr(module, "_zero_init", False) and module.weight.ndim == 2 and module.weight.shape[0] >= 256:
+                nn.init.orthogonal_(module.weight, gain=1.0)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram_emb is not None:
+            x = x + self.bigram_emb(input_ids)
+        x = self.smear_gate(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -938,6 +990,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        bigram_hash_buckets=args.bigram_hash_buckets,
+        bigram_hash_dim=args.bigram_hash_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1064,10 +1118,9 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # EMA for smoother weights (better quantization)
-    ema_decay = 0.999
-    ema_start_frac = 2.0  # disabled (set <1.0 to enable)
-    ema_state: dict[str, Tensor] | None = None
+    # SWA: checkpoint averaging during warmdown for smoother weights
+    swa_state: dict[str, Tensor] | None = None
+    swa_count = 0
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1142,14 +1195,15 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        # EMA update: track smoothed weights for better quantization
-        if stop_after_step is not None or (max_wallclock_ms and elapsed_ms >= max_wallclock_ms * ema_start_frac):
+        # SWA: collect checkpoint snapshots during warmdown
+        if args.swa_every > 0 and scale < args.swa_start_frac and step % args.swa_every == 0:
             sd = base_model.state_dict()
-            if ema_state is None:
-                ema_state = {k: v.clone() for k, v in sd.items()}
+            if swa_state is None:
+                swa_state = {k: v.detach().float().clone() for k, v in sd.items()}
             else:
-                for k in ema_state:
-                    ema_state[k].mul_(ema_decay).add_(sd[k], alpha=1.0 - ema_decay)
+                for k in swa_state:
+                    swa_state[k].add_(sd[k].detach().float())
+            swa_count += 1
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1177,10 +1231,12 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Load EMA weights for serialization (smoother = better quantization)
-    if ema_state is not None:
-        log0(f"ema:loading smoothed weights (decay={ema_decay})")
-        base_model.load_state_dict(ema_state, strict=True)
+    # Load SWA averaged weights for serialization (smoother = better quantization)
+    if swa_state is not None and swa_count > 1:
+        log0(f"swa:applying averaged {swa_count} checkpoints")
+        current_sd = base_model.state_dict()
+        avg_state = {k: (v / swa_count).to(dtype=current_sd[k].dtype) for k, v in swa_state.items()}
+        base_model.load_state_dict(avg_state, strict=True)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1200,7 +1256,13 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = lzma.compress(quant_raw, preset=9 | lzma.PRESET_EXTREME)
+    try:
+        import zstandard
+        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
+        _compressor = "zstd"
+    except ImportError:
+        quant_blob = lzma.compress(quant_raw, preset=9 | lzma.PRESET_EXTREME)
+        _compressor = "lzma"
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
@@ -1218,7 +1280,11 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int6.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu", weights_only=False)
+    try:
+        decompressed = zstandard.ZstdDecompressor().decompress(quant_blob_disk) if _compressor == "zstd" else lzma.decompress(quant_blob_disk)
+    except Exception:
+        decompressed = lzma.decompress(quant_blob_disk)
+    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu", weights_only=False)
     base_model.load_state_dict(dequantize_state_dict_int6(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
