@@ -62,7 +62,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -91,8 +91,8 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
-    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 128))
+    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 64))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1319,6 +1319,26 @@ def main() -> None:
         current_sd = base_model.state_dict()
         avg_state = {k: (v / swa_count).to(dtype=current_sd[k].dtype) for k, v in swa_state.items()}
         base_model.load_state_dict(avg_state, strict=True)
+
+    # Stiefel condition-number clipping: Muon trains 2D matrices to be near-orthogonal.
+    # SWA averaging can drift weights off the Stiefel manifold, spreading singular values.
+    # Clipping the condition number improves quantization conditioning without destroying
+    # the trained magnitudes. Gentler than full orthogonal projection.
+    stiefel_cond = float(os.environ.get("STIEFEL_COND_CLIP", "0"))
+    if stiefel_cond > 1.0:
+        with torch.no_grad():
+            reproj_count = 0
+            for name, param in base_model.named_parameters():
+                if (param.ndim == 2 and param.numel() > 65536
+                    and not any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS)
+                    and "tok_emb" not in name):
+                    W = param.float()
+                    U, S, Vt = torch.linalg.svd(W, full_matrices=False)
+                    s_min = S.max() / stiefel_cond
+                    S_clipped = torch.clamp(S, min=s_min)
+                    param.copy_((U @ torch.diag(S_clipped) @ Vt).to(dtype=param.dtype))
+                    reproj_count += 1
+        log0(f"stiefel_cond_clip: clipped cond to {stiefel_cond} on {reproj_count} matrices")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
